@@ -1,0 +1,6 @@
+Baseline Model Results
+----------------------
+ROC-AUC: 0.999805971009188
+Suspicious Precision: 0.96
+Suspicious Recall: 0.99
+Suspicious F1-score: 0.97

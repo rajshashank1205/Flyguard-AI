@@ -1,0 +1,21 @@
+PRISM Comparison
+================
+
+Amount-Only Model:
+ROC-AUC: 0.9586103965647548
+Suspicious Recall: 0.48
+Suspicious F1-score: 0.56
+
+Full Baseline Model:
+ROC-AUC: 0.999805971009188
+Suspicious Recall: 0.99
+Suspicious F1-score: 0.97
+
+Graph-Enhanced Model:
+ROC-AUC: 0.9998610447402044
+Suspicious Recall: 0.98
+Suspicious F1-score: 0.97
+
+Finding:
+Amount alone misses many suspicious transactions.
+Behavioral and graph features provide stronger detection.

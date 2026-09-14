@@ -1,0 +1,6 @@
+Graph-Enhanced Model Results
+----------------------------
+ROC-AUC: 0.9998610447402044
+Suspicious Precision: 0.96
+Suspicious Recall: 0.98
+Suspicious F1-score: 0.97
