@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from prismtrace import PRISMtrace
 
 from langchain_ollama import ChatOllama
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 from langgraph.graph import StateGraph, START
@@ -165,6 +165,11 @@ def unavailable_response(tool_results: list[dict[str, Any]]) -> str:
     )
 
 
+def risk_band_from_score(risk_score: float) -> int:
+    """Map a probability to the five-level display band used in reports."""
+    return min(5, int(risk_score * 5) + 1)
+
+
 def response_from_transaction_result(result: dict[str, Any]) -> str:
     """Render a verified transaction result without an LLM round trip.
 
@@ -175,30 +180,38 @@ def response_from_transaction_result(result: dict[str, Any]) -> str:
     if result.get("status") != "ok":
         return unavailable_response([result])
 
+    risk_score = float(result["risk_score"])
+    risk_band = risk_band_from_score(risk_score)
     is_higher_risk = result["decision"] == "HIGHER RISK"
-    assessment = (
-        "This transaction has a higher-risk signal and should be reviewed by "
-        "a human analyst."
+    assessment = "Higher risk" if is_higher_risk else "Lower risk"
+    rationale = (
+        f"The verified score is at or above the {RISK_THRESHOLD:.4f} review "
+        "threshold, so a human review is required before any adverse action."
         if is_higher_risk
-        else "This transaction has a lower-risk signal and routine monitoring "
-        "is sufficient."
+        else f"The verified score is below the {RISK_THRESHOLD:.4f} review "
+        "threshold, so this record does not currently trigger analyst review."
     )
     action = (
-        "Route the case to a human analyst before any adverse action is taken."
+        "Open a human-review case; validate the transaction and related account "
+        "history; document the rationale before taking any adverse action."
         if is_higher_risk
-        else "Continue routine monitoring and reassess if new verified activity "
-        "changes the risk signal."
+        else "Continue routine monitoring; create a human-review case if a future "
+        "verified score reaches the review threshold or material new evidence appears."
     )
     return (
-        f"Assessment: {assessment}\n\n"
-        "Evidence: Transaction "
-        f"{result['transaction_id']} is ${result['amount']:.2f}; its verified "
-        f"model risk score is {result['risk_score']:.4f}. Sender "
-        f"{result['sender']} has {result['sender_transaction_count']} recorded "
-        f"transactions, and receiver {result['receiver']} has "
-        f"{result['receiver_transaction_count']}.\n\n"
+        f"Assessment: {assessment}; model risk band {risk_band}/5. {rationale}\n\n"
+        "Evidence:\n"
+        f"- Transaction {result['transaction_id']}: ${result['amount']:.2f}.\n"
+        f"- Verified model risk score: {risk_score:.4f}; review threshold: "
+        f"{RISK_THRESHOLD:.4f}.\n"
+        f"- Sender {result['sender']}: {result['sender_transaction_count']} "
+        "recorded transactions.\n"
+        f"- Receiver {result['receiver']}: {result['receiver_transaction_count']} "
+        "recorded transactions.\n\n"
         f"Recommended action: {action}\n\n"
-        "Caveat: This is a risk signal, not a finding of wrongdoing."
+        "Caveat: This is a point-in-time model risk signal based on verified "
+        "transaction and account-history data. It is not a finding of wrongdoing "
+        "or a basis for an automated adverse action."
     )
 
 
@@ -207,20 +220,36 @@ def response_from_account_result(result: dict[str, Any]) -> str:
     if result.get("status") != "ok":
         return unavailable_response([result])
 
+    flagged_transactions = (
+        result["suspicious_sent_transactions"]
+        + result["suspicious_received_transactions"]
+    )
+    assessment = (
+        "Review priority" if flagged_transactions else "Routine-priority activity"
+    )
+    action = (
+        "Open a human-review case for the flagged underlying transactions and "
+        "their counterparties before taking any adverse action."
+        if flagged_transactions
+        else "Continue routine monitoring and reassess if new verified activity "
+        "creates a transaction-level risk signal."
+    )
     return (
-        "Assessment: This account activity is provided for investigation "
-        "prioritization; no conclusion about wrongdoing is made.\n\n"
-        "Evidence: Account "
-        f"{result['account_id']} sent {result['transactions_sent']} transactions "
-        f"totaling ${result['total_sent_amount']:.2f} and received "
+        f"Assessment: {assessment}. This is an account-activity summary, not a "
+        "finding of wrongdoing.\n\n"
+        "Evidence:\n"
+        f"- Account {result['account_id']} sent {result['transactions_sent']} "
+        f"transactions totaling ${result['total_sent_amount']:.2f} and received "
         f"{result['transactions_received']} totaling "
-        f"${result['total_received_amount']:.2f}. It has "
-        f"{result['suspicious_sent_transactions']} flagged outgoing and "
-        f"{result['suspicious_received_transactions']} flagged incoming "
-        "transactions in the verified data.\n\n"
-        "Recommended action: Review the verified counterparties and transaction "
-        "history if the account requires a risk decision.\n\n"
-        "Caveat: This is a risk signal, not a finding of wrongdoing."
+        f"${result['total_received_amount']:.2f}.\n"
+        f"- Flagged records in verified data: "
+        f"{result['suspicious_sent_transactions']} outgoing and "
+        f"{result['suspicious_received_transactions']} incoming.\n"
+        f"- Counterparties: {result['unique_counterparties_sent_to']} sent-to and "
+        f"{result['unique_counterparties_received_from']} received-from.\n\n"
+        f"Recommended action: {action}\n\n"
+        "Caveat: The summary is limited to the verified activity above and is not "
+        "a basis for an automated adverse action."
     )
 
 
@@ -290,19 +319,6 @@ def load_transaction_rows() -> pd.DataFrame:
 
 
 @lru_cache(maxsize=1)
-def load_risk_scores() -> dict[str, float]:
-    """Calculate every persisted-model score once during startup warm-up.
-
-    The batch uses the identical model and feature columns as the former
-    request-time ``predict_proba`` call.  Only *when* each score is calculated
-    changes; the score and threshold decision do not.
-    """
-    df = load_feature_data()
-    scores = load_risk_model().predict_proba(df[MODEL_FEATURES])[:, 1]
-    return dict(zip(df["transaction_id"].astype(str), scores))
-
-
-@lru_cache(maxsize=1)
 def load_account_statistics() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Aggregate account facts once so account investigations stay local."""
     df = load_feature_data()
@@ -339,10 +355,12 @@ def get_transaction_result(transaction_id: str) -> dict[str, Any]:
             }
 
         # Keep the former first-match behavior if a source file contains a
-        # duplicate transaction ID.
+        # duplicate transaction ID, while executing the XGBoost model for this
+        # request rather than serving a precomputed probability.
         if isinstance(transaction, pd.DataFrame):
             transaction = transaction.iloc[0]
-        risk_score = float(load_risk_scores()[transaction_id])
+        model_input = load_transaction_rows().loc[[transaction_id], MODEL_FEATURES]
+        risk_score = float(load_risk_model().predict_proba(model_input)[0][1])
         decision = "HIGHER RISK" if risk_score >= RISK_THRESHOLD else "LOWER RISK"
         return {
             "status": "ok",
@@ -417,22 +435,27 @@ def investigate_account(account_id: str) -> str:
 
 def fast_response_for_input(
     user_input: str,
-) -> tuple[str, list[dict[str, Any]], list[str]] | None:
-    """Answer ID-based investigations locally, avoiding two Ollama calls.
+) -> tuple[str, list[dict[str, Any]], list[str], AIMessage] | None:
+    """Answer ID-based investigations with one live model-rendering call.
 
-    An ID unambiguously identifies the requested tool and the required response
-    fields, so an LLM cannot add verified evidence.  General conversation still
-    follows the existing LangGraph/Ollama route below.
+    An ID unambiguously identifies the evidence lookup, so we avoid the former
+    model call used solely to select a tool. Qwen still renders every verified
+    case, and general conversation follows the existing LangGraph route below.
     """
     transaction_ids = {
         match.group().upper() for match in TRANSACTION_ID_PATTERN.finditer(user_input)
     }
     if len(transaction_ids) == 1:
         result = get_transaction_result(transaction_ids.pop())
+        fallback_response = enforce_compliance_gate(
+            response_from_transaction_result(result), [result]
+        )
+        response = live_model_report(user_input, result, fallback_response)
         return (
-            enforce_compliance_gate(response_from_transaction_result(result), [result]),
+            content_to_text(response.content),
             [result],
             ["analyze_transaction"],
+            response,
         )
     if len(transaction_ids) > 1:
         return None
@@ -442,10 +465,15 @@ def fast_response_for_input(
     }
     if len(account_ids) == 1:
         result = get_account_result(account_ids.pop())
+        fallback_response = enforce_compliance_gate(
+            response_from_account_result(result), [result]
+        )
+        response = live_model_report(user_input, result, fallback_response)
         return (
-            enforce_compliance_gate(response_from_account_result(result), [result]),
+            content_to_text(response.content),
             [result],
             ["investigate_account"],
+            response,
         )
 
     return None
@@ -473,10 +501,110 @@ class AgentState(TypedDict):
 llm = ChatOllama(
     model=MODEL_NAME,
     temperature=0,
-    num_predict=256,
+    # One concise, grounded rendering call is made for every identified case.
+    # Keeping the model resident avoids cold-start time between investigations.
+    num_ctx=512,
+    num_thread=6,
+    num_predict=64,
+    keep_alive="30m",
+    client_kwargs={"timeout": 25.0},
 )
 
 llm_with_tools = llm.bind_tools(tools)
+
+
+def live_model_report(
+    user_input: str,
+    result: dict[str, Any],
+    fallback_response: str,
+) -> AIMessage:
+    """Run Qwen once to render verified evidence for the current case.
+
+    The numerical decision is made by the XGBoost model in
+    ``get_transaction_result``. Qwen receives that result as immutable evidence
+    and only writes the analyst-facing explanation. This preserves live model
+    execution without reintroducing the old tool-selection model call.
+    """
+    if result.get("status") != "ok":
+        return AIMessage(content=fallback_response)
+
+    verified_evidence = {
+        key: value
+        for key, value in result.items()
+        if key not in {"status", "tool_latency_ms"}
+    }
+    if "risk_score" in verified_evidence:
+        verified_evidence["risk_band"] = risk_band_from_score(
+            float(verified_evidence["risk_score"])
+        )
+        verified_evidence["review_threshold"] = RISK_THRESHOLD
+
+    system_message = SystemMessage(
+        content=(
+            "You are FlyGuard AI. Write a grounded financial-risk case report "
+            "using only the verified JSON. Preserve every number; do not invent "
+            "facts, causes, or people. Transaction risk_score and decision are "
+            "authoritative. Do not call tools or mention JSON.\n\n"
+            "Use exactly: Assessment:, Evidence:, Recommended action:, Caveat:. "
+            "Give 2-4 evidence facts. For a transaction state the risk band and "
+            "threshold rationale. Use monitoring for lower risk and human review "
+            "for higher risk. Never allege crime or recommend automated adverse "
+            "action. Do not call a transaction normal or add thresholds that are "
+            "not in the JSON. The Caveat must say this is a risk signal, not a "
+            "finding of wrongdoing or a basis for an automated adverse action. "
+            "Maximum 70 words."
+        )
+    )
+    user_message = HumanMessage(
+        content=(
+            f"User request: {user_input}\n\n"
+            f"Verified evidence: {json.dumps(verified_evidence, default=str)}"
+        )
+    )
+
+    try:
+        response = llm.invoke([system_message, user_message])
+        content = enforce_compliance_gate(content_to_text(response.content), [result])
+        required_sections = (
+            "assessment:",
+            "evidence:",
+            "recommended action:",
+            "caveat:",
+        )
+        lower_content = content.lower()
+        required_facts = [str(result.get("transaction_id") or result.get("account_id"))]
+        if "risk_score" in result:
+            required_facts.extend(
+                [
+                    f"{float(result['risk_score']):.4f}",
+                    str(result["decision"]).lower(),
+                ]
+            )
+        if (
+            not all(section in lower_content for section in required_sections)
+            or not all(fact.lower() in lower_content for fact in required_facts)
+            or "risk signal" not in lower_content
+            or "automated adverse action" not in lower_content
+            or "normal" in lower_content
+        ):
+            return response.model_copy(update={"content": fallback_response})
+        if content != content_to_text(response.content):
+            response = response.model_copy(update={"content": content})
+        return response
+    except Exception:
+        # A local Ollama outage must not prevent access to the verified model
+        # result; the deterministic report remains compliant and grounded.
+        return AIMessage(content=fallback_response)
+
+
+def warm_live_model() -> None:
+    """Load Qwen before the first user turn, without caching a case response."""
+    try:
+        llm.invoke([HumanMessage(content="Reply with exactly: ready")])
+    except Exception:
+        # The per-request fallback in live_model_report handles an unavailable
+        # local model without hiding the verified XGBoost result.
+        pass
 
 
 # ============================================================
@@ -635,13 +763,13 @@ def record_prism_turn(
 # ============================================================
 
 if __name__ == "__main__":
-    # Move one-time CSV and model deserialization out of the measured request
-    # path. Prediction itself remains exactly the same as before.
+    # Keep immutable data and model deserialization out of the request path.
+    # XGBoost prediction and the Qwen report call still run for every case.
     load_feature_data()
     load_risk_model()
     load_transaction_rows()
-    load_risk_scores()
     load_account_statistics()
+    warm_live_model()
 
     print("FlyGuard conversational agent started.")
     print("Type 'exit' to stop.\n")
@@ -670,8 +798,13 @@ if __name__ == "__main__":
             turn_started_at = perf_counter()
             fast_result = fast_response_for_input(user_input)
             if fast_result is not None:
-                final_response, fast_tool_results, fast_tool_names = fast_result
-                messages.append(AIMessage(content=final_response))
+                (
+                    final_response,
+                    fast_tool_results,
+                    fast_tool_names,
+                    live_model_message,
+                ) = fast_result
+                messages.append(live_model_message)
                 turn_messages = messages[prior_message_count:]
             else:
                 result = app.invoke(
