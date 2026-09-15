@@ -6,3 +6,8 @@ xgboost
 matplotlib
 joblib
 streamlit
+python-dotenv>=1.0.0
+prismtrace-sdk>=0.4.3
+langgraph>=1.2.11
+langchain-ollama>=1.1.0
+ollama>=0.6.2
